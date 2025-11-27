@@ -6,83 +6,83 @@ class GridPhysics:
     def __init__(self):
         self.net = self._build_network()
         
+        # --- THERMAL STATE VARIABLES (IEEE C57.91) ---
+        # We assume the simulation starts at steady state with ambient temperature
+        self.prev_top_oil_rise = 0.0  
+        self.tau_oil = 180.0     # Oil time constant (minutes) - typical for 10MVA
+        self.dt = 60.0           # Simulation timestep (minutes)
+        
     def _build_network(self):
         """
         Builds a single-feeder distribution model.
         115 kV Source -> 10 MVA Transformer -> 13.8 kV Feeder
         """
         net = pp.create_empty_network()
-        
-        # 1. Grid Connection (Slack Bus)
         hv_bus = pp.create_bus(net, vn_kv=115, name="HV Substation")
         pp.create_ext_grid(net, bus=hv_bus, vm_pu=1.02)
-        
-        # 2. Distribution Bus
         lv_bus = pp.create_bus(net, vn_kv=13.8, name="Feeder Head")
         
-        # 3. The Transformer (The Asset we are protecting)
         pp.create_transformer_from_parameters(
             net, hv_bus=hv_bus, lv_bus=lv_bus, 
             sn_mva=10, vn_hv_kv=115, vn_lv_kv=13.8, 
             vkr_percent=0.5, vk_percent=10, 
             pfe_kw=10, i0_percent=0.1, name="Main Tx"
         )
-        
-        # 4. Aggregated Load (Placeholders)
         pp.create_load(net, bus=lv_bus, p_mw=0, q_mvar=0, name="Feeder Load")
-        
         return net
 
     def solve_power_flow(self, load_mw):
-        """
-        Runs Newton-Raphson Power Flow.
-        Returns: Transformer Loading (%) and Voltage (p.u.)
-        """
-        # Calculate Reactive Power (Assuming 0.95 PF)
-        q_mvar = load_mw * 0.33
+        """Runs Newton-Raphson Power Flow."""
+        q_mvar = load_mw * 0.33  # 0.95 PF assumption
         
-        # FIX: Use .loc to avoid Pandas FutureWarnings
         self.net.load.loc[0, 'p_mw'] = load_mw
         self.net.load.loc[0, 'q_mvar'] = q_mvar
         
         try:
-            # FIX: Use 'flat' initialization and more iterations to handle heavy overloads
             pp.runpp(self.net, algorithm='nr', max_iteration=50, init='flat')
-            
-            # Extract results
             loading_percent = self.net.res_trafo.loading_percent[0]
-            voltage_pu = self.net.res_bus.vm_pu[1] # Index 1 is the LV bus
+            voltage_pu = self.net.res_bus.vm_pu[1]
             return loading_percent, voltage_pu
-            
-        except Exception as e:
-            # If it STILL crashes, it means the grid collapsed (Voltage collapse).
-            # We return "Extreme" values to show on the plot that things are bad.
-            logging.warning(f"Grid Collapse at {load_mw:.2f} MW! Returning max values.")
-            return 150.0, 0.85 # 150% overload, 0.85 p.u. voltage (Brownout)
+        except Exception:
+            logging.warning(f"Grid Collapse at {load_mw:.2f} MW!")
+            return 150.0, 0.85
 
     def calculate_thermal_aging(self, loading_percent, ambient_temp_c):
         """
-        Estimates Transformer Hot Spot Temperature (HST) using IEEE C57.91 logic.
+        Calculates Hot Spot Temp (HST) using IEEE C57.91 Difference Equations.
+        Tracks state from the previous timestep.
         """
+        # Parameters for a typical ONAN Transformer
         rated_top_oil_rise = 50.0
         rated_hot_spot_rise = 15.0
+        m = 0.8  # Oil exponent
+        n = 1.6  # Winding exponent
         
-        # Load Factor K
         K = loading_percent / 100.0
         
-        # 1. Top Oil Rise
-        top_oil_rise = rated_top_oil_rise * (K ** 1.6)
+        # --- 1. Top Oil Rise (Transient) ---
+        # Target rise at this specific load (if held forever)
+        target_oil_rise = rated_top_oil_rise * (K ** m)
         
-        # 2. Hot Spot Gradient
-        hot_spot_gradient = rated_hot_spot_rise * (K ** 1.6)
+        # Difference Equation: New = Old + (Target - Old) * (1 - e^(-dt/tau))
+        change = (target_oil_rise - self.prev_top_oil_rise) * (1 - np.exp(-self.dt / self.tau_oil))
+        current_top_oil_rise = self.prev_top_oil_rise + change
         
-        # 3. Total HST
-        hst = ambient_temp_c + top_oil_rise + hot_spot_gradient
+        # Update State for next loop
+        self.prev_top_oil_rise = current_top_oil_rise
         
-        # 4. Aging Factor (FAA)
+        # --- 2. Hot Spot Gradient (Instantaneous) ---
+        # We assume winding heats much faster than oil, so we treat this as steady-state for 1-hour steps
+        hot_spot_gradient = rated_hot_spot_rise * (K ** n)
+        
+        # --- 3. Total HST ---
+        hst = ambient_temp_c + current_top_oil_rise + hot_spot_gradient
+        
+        # --- 4. Aging Factor (FAA) ---
+        # IEEE standard aging equation
         if hst > 110:
             faa = np.exp(15000/383 - 15000/(hst + 273))
         else:
-            faa = 1.0
+            faa = 1.0 # Standard aging
             
         return hst, faa
